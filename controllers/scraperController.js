@@ -1,90 +1,56 @@
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const cheerio = require('cheerio');
 const Product = require('../models/Product');
 const crypto = require('crypto');
 
-async function scrapeAmazon(url) {
-  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const page = await browser.newPage();
-  await page.goto(url, { waitUntil: 'networkidle2' });
-  await page.waitForSelector('#productTitle');
-  const productName = await page.$eval('#productTitle', el => el.textContent.trim());
-  const productImage = await page.$eval('#landingImage', el => el.src).catch(() => '');
-  const currentPriceText = await page.$eval('.a-price-whole', el => el.textContent.trim()).catch(() => null);
-  const fraction = await page.$eval('.a-price-fraction', el => el.textContent.trim()).catch(() => '');
-  const originalPriceText = await page.$eval('span.a-text-strike', el => el.textContent.trim()).catch(() => null);
-  const currentPrice = currentPriceText ? parseFloat((currentPriceText + fraction).replace(/[^0-9.]/g, '')) : null;
-  const originalPrice = originalPriceText ? parseFloat(originalPriceText.replace(/[^0-9.]/g, '')) : null;
-  const description = await page.$eval('#productDescription', el => el.textContent.trim()).catch(() => '');
-  await browser.close();
-  return { productName, productImage, currentPrice, originalPrice, description };
-}
-
-async function scrapeFlipkart(url) {
-  const browser = await puppeteer.launch({ headless: false, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const page = await browser.newPage();
-  await page.goto(url, { waitUntil: 'networkidle2' });
-  try {
-    await page.waitForSelector('span.B_NuCI', { timeout: 10000 });
-    const productName = await page.$eval('span.B_NuCI', el => el.textContent.trim());
-    const productImage = await page.$eval('img._396cs4', el => el.src).catch(() => '');
-    const currentPriceText = await page.$eval('div._30jeq3._16Jk6d', el => el.textContent.trim()).catch(() => null);
-    const originalPriceText = await page.$eval('div._3I9_wc._2p6lqe', el => el.textContent.trim()).catch(() => null);
-    const currentPrice = currentPriceText ? parseFloat(currentPriceText.replace(/[^0-9.]/g, '')) : null;
-    const originalPrice = originalPriceText ? parseFloat(originalPriceText.replace(/[^0-9.]/g, '')) : null;
-    const description = await page.$eval('div._1mXcCf', el => el.textContent.trim()).catch(() => '');
-    await browser.close();
-    return { productName, productImage, currentPrice, originalPrice, description };
-  } catch (err) {
-    const html = await page.content();
-    console.error('Flipkart scraping error:', err);
-    console.error('Flipkart page HTML:', html);
-    await browser.close();
-    throw err;
-  }
-}
-
-async function scrapeMeesho(url) {
-  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const page = await browser.newPage();
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
-  await page.goto(url, { waitUntil: 'networkidle2' });
-  await page.waitForSelector('h1');
-  const productName = await page.$eval('h1', el => el.textContent.trim());
-  const productImage = await page.$eval('img', el => el.src).catch(() => '');
-  const currentPriceText = await page.$eval('span.pdp-price', el => el.textContent.trim()).catch(() => null);
-  const originalPriceText = await page.$eval('span.pdp-cut-price', el => el.textContent.trim()).catch(() => null);
-  const currentPrice = currentPriceText ? parseFloat(currentPriceText.replace(/[^0-9.]/g, '')) : null;
-  const originalPrice = originalPriceText ? parseFloat(originalPriceText.replace(/[^0-9.]/g, '')) : null;
-  const description = await page.$eval('div.pdp-product-description-content', el => el.textContent.trim()).catch(() => '');
-  await browser.close();
-  return { productName, productImage, currentPrice, originalPrice, description };
-}
-
 exports.scrapeProduct = async (req, res) => {
   const { productUrl } = req.body;
+
   if (!productUrl) {
     return res.status(400).json({ message: 'Product URL is required' });
   }
+
+  // Basic URL validation
   try {
+    new URL(productUrl);
+  } catch (error) {
+    return res.status(400).json({ message: 'Invalid URL format' });
+  }
+
+  console.log(`Received product link: ${productUrl}`);
     const hash = crypto.createHash('sha256').update(productUrl).digest('hex');
+
+  try {
+    const { data } = await axios.get(productUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    });
+    const $ = cheerio.load(data);
+
     let productDetails = {};
+
     const url = new URL(productUrl);
     const hostname = url.hostname;
+
     if (hostname.includes('amazon')) {
-      productDetails = await scrapeAmazon(productUrl);
-    } else if (hostname.includes('flipkart')) {
-      productDetails = await scrapeFlipkart(productUrl);
-    } else if (hostname.includes('meesho')) {
-      productDetails = await scrapeMeesho(productUrl);
+      productDetails = scrapeAmazon($);
     } else {
       return res.status(400).json({ message: 'Unsupported website for scraping.' });
     }
+
     const { productName, productImage, currentPrice, originalPrice, description } = productDetails;
+
     if (!productName || !currentPrice) {
       return res.status(404).json({ message: 'Could not scrape product details. Check URL or selectors.' });
     }
+
+    // Store the product key (URL in this case) in the database
     let product = await Product.findOne({ hash: hash });
+
     if (product) {
+      // Update existing product
       product.title = productName;
       product.currentPrice = currentPrice;
       product.originalPrice = originalPrice;
@@ -93,6 +59,7 @@ exports.scrapeProduct = async (req, res) => {
       product.url = productUrl;
       product.hash = hash;
     } else {
+      // Create new product
       product = new Product({
         url: productUrl,
         hash: hash,
@@ -103,23 +70,53 @@ exports.scrapeProduct = async (req, res) => {
         description: description,
       });
     }
+
     await product.save();
-    const { checkAndNotifyTargetPrice } = require('./notificationController');
-    await checkAndNotifyTargetPrice(product);
+
+    console.log('Processed product data:', { productName, productImage, currentPrice, originalPrice, description });
     res.status(200).json({
-      _id: product._id,
       productName,
       productImage,
-      currentPrice,
-      originalPrice,
+      currentPrice: currentPrice,
+      originalPrice: originalPrice,
       description,
       message: 'Product scraped and stored successfully',
     });
   } catch (error) {
     console.error(`Error scraping product from ${productUrl}:`, error);
+    if (error.code === 11000) {
+      // Duplicate key error (E11000) for unique index
+      return res.status(409).json({
+        message: 'Product with this URL already exists or a hash collision occurred.',
+        error: error.message,
+      });
+    }
     res.status(500).json({ message: 'Error scraping product', error: error.message });
   }
 };
+
+
+function scrapeAmazon($) {
+  const productName = $('#productTitle').text().trim();
+  console.log('Scraped productName:', productName);
+  const productImage = $('#landingImage').attr('src');
+  console.log('Scraped productImage:', productImage);
+  const currentPriceText = $('.a-price-whole').first().text().trim() + $('.a-price-fraction').first().text().trim();
+  console.log('Scraped currentPriceText:', currentPriceText);
+  const originalPriceText = $('span.a-text-strike').first().text().trim();
+  console.log('Scraped originalPriceText:', originalPriceText);
+
+
+  const currentPrice = currentPriceText ? parseFloat(currentPriceText.replace(/[^0-9.]/g, '')) : null;
+  console.log('Parsed currentPrice:', currentPrice);
+  const originalPrice = originalPriceText ? parseFloat(originalPriceText.replace(/[^0-9.]/g, '')) : null;
+  console.log('Parsed originalPrice:', originalPrice);
+  const description = $('#productDescription').text().trim();
+  console.log('Scraped description:', description);
+
+
+  return { productName, productImage, currentPrice, originalPrice, description };
+}
 
 function scrapeFlipkart($) {
   let productName = $('span.B_NuCI').text().trim();
